@@ -1,0 +1,173 @@
+import os
+import re
+import time
+import json
+import requests
+from pathlib import Path
+
+# === CONFIG ===
+WORDS_FILE = r"C:\Users\besio\Desktop\albanian_words.txt"
+OUTPUT_DIR = r"C:\Users\besio\Desktop\IA\DATA\raw\FJALOR"
+MASTER_OUTPUT = os.path.join(OUTPUT_DIR, "validated_albanian_words.txt")
+LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
+LM_MODEL = "openai/gpt-oss-20b"   # adjust to exact model name in LM Studio
+BATCH_SIZE = 1000                  # batch size requested
+TIMEOUT = 90
+RETRIES = 2
+VERBOSE = False                   # keep False to suppress per-word/batch prints
+
+# === FILTERS / HELPERS ===
+# allow alphabetic tokens including common Albanian diacritics (no punctuation)
+alpha_re = re.compile(r"^[A-Za-zÇçËëÁÀÂÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÖØÙÚÛÜÝàáâäåæçèéêëìíîïñòóôöøùúûüýë]+$")
+
+FEWSHOT_VALID = [
+    "libër","libri","librit","libra","vajzë","vajza","djalë","djem",
+    "shkollë","shtëpi","punoj","lexoj","mirë","i","e","dhe","një","nje"
+]
+FEWSHOT_INVALID = [
+    "abdullahut","abdullahun","abdulla","washingtonit","tirana","bmw","iphone",
+    "x9","Beznarf2129","Bh3x5R396"
+]
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+
+def is_alpha_token(tok: str) -> bool:
+    return bool(alpha_re.match(tok))
+
+def build_csv_prompt(words_batch):
+    numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(words_batch))
+    prompt = (
+        "You are an Albanian lexicographer.\n"
+        "Task: For each token below, output exactly one CSV row per line in the SAME ORDER with format:\n"
+        "token,1  or  token,0\n"
+        "Meaning: 1 = valid Albanian dictionary word (noun/verb/adjective/adverb/function word — common lemmas or normal inflected forms).\n"
+        "0 = NOT valid for a general Albanian vocabulary list (personal name, surname, toponym/place, brand, foreign word, abbreviation, code, or junk).\n"
+        "Names and toponyms must be labeled 0 even if lowercased.\n\n"
+        "VALID examples (1):\n" + ", ".join(FEWSHOT_VALID) + "\n\n"
+        "NOT VALID examples (0):\n" + ", ".join(FEWSHOT_INVALID) + "\n\n"
+        "Now classify these tokens (one per line) in this exact CSV format and keep the same order:\n\n"
+        + numbered + "\n\n"
+        "Output example:\n"
+        "shtëpi,1\n"
+        "abdullahut,0\n"
+        "libër,1\n"
+        "washington,0\n"
+        "Do not add any extra text or commentary."
+    )
+    return prompt
+
+def call_lm_for_batch(words_batch):
+    payload = {
+        "model": LM_MODEL,
+        "messages": [
+            {"role": "system", "content": "Respond ONLY with CSV rows: token,1 or token,0. No commentary."},
+            {"role": "user", "content": build_csv_prompt(words_batch)}
+        ],
+        "temperature": 0,
+        "max_tokens": 2000,
+        "stream": False,
+        "stop": ["\n\n", "###"]
+    }
+    for attempt in range(RETRIES + 1):
+        try:
+            resp = requests.post(LM_STUDIO_URL, headers={"Content-Type": "application/json"},
+                                 data=json.dumps(payload), timeout=TIMEOUT)
+            resp.raise_for_status()
+            out = resp.json()
+            txt = out["choices"][0]["message"]["content"].strip()
+            return txt
+        except Exception:
+            time.sleep(0.8)
+    return ""
+
+def parse_csv_output(words_batch, raw_txt):
+    """
+    Parse CSV-like output. Return list of (token, label) aligned to input order.
+    If parsing fails for some lines, default label '0'.
+    """
+    lines = [ln.strip() for ln in raw_txt.splitlines() if ln.strip()]
+    parsed = []
+    # first try simple ordered parsing: take only lines with a comma and two fields
+    for ln in lines:
+        if "," not in ln:
+            continue
+        tok, lab = [p.strip() for p in ln.split(",", 1)]
+        if lab in ("0", "1"):
+            parsed.append((tok, lab))
+    # If parsed length matches batch length and tokens align, accept.
+    if len(parsed) == len(words_batch):
+        # attempt to verify order by comparing tokens ignoring case/diacritics
+        ok = True
+        for inp, (tok, _) in zip(words_batch, parsed):
+            if tok.lower() != inp.lower():
+                ok = False
+                break
+        if ok:
+            return parsed
+    # If not aligned, try to build a mapping token->label and map back to inputs
+    mapping = {}
+    for tok, lab in parsed:
+        mapping[tok.lower()] = lab
+    result = []
+    for w in words_batch:
+        lab = mapping.get(w.lower(), "0")
+        result.append((w, lab))
+    return result
+
+def process_batches(words):
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    validated = []
+    # prefilter silently: keep only alpha tokens
+    filtered = [w for w in words if is_alpha_token(w)]
+    # deduplicate while preserving order
+    seen = set()
+    dedup = []
+    for w in filtered:
+        lw = w.lower()
+        if lw in seen:
+            continue
+        seen.add(lw)
+        dedup.append(w)
+    # process in batches of BATCH_SIZE
+    for i in range(0, len(dedup), BATCH_SIZE):
+        batch = dedup[i:i+BATCH_SIZE]
+        raw = call_lm_for_batch(batch)
+        # fallback: if empty response, split batch in half and retry recursively
+        if not raw:
+            if len(batch) <= 1:
+                # nothing we can do, skip
+                continue
+            # split and process halves
+            mid = len(batch) // 2
+            process_batches(batch[:mid])
+            process_batches(batch[mid:])
+            continue
+        parsed = parse_csv_output(batch, raw)
+        for tok, lab in parsed:
+            if lab == "1":
+                fn = sanitize_filename(tok) + ".txt"
+                path = os.path.join(OUTPUT_DIR, fn)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(tok + "\n")
+                validated.append(tok)
+        # brief pause to avoid overloading local model
+        time.sleep(0.2)
+    # write master file
+    if validated:
+        with open(MASTER_OUTPUT, "w", encoding="utf-8") as m:
+            for v in validated:
+                m.write(v + "\n")
+    return len(validated)
+
+# === RUN ===
+def main():
+    with open(WORDS_FILE, "r", encoding="utf-8") as f:
+        words = [line.strip() for line in f if line.strip()]
+    count = process_batches(words)
+    if not VERBOSE:
+        # minimal final confirmation only
+        print(f"Done. {count} validated words saved to: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
